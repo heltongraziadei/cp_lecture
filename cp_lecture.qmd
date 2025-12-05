@@ -1,0 +1,153 @@
+---
+title: "Tutorial de Predição Conforme"
+format:
+  html:
+    code-fold: true
+    toc: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Tutorial de Predição Conforme
+
+Este tutorial ilustra o uso de Predição Conforme (*Split Conformal Prediction*) no conjunto de dados *California Housing (*<https://www.kaggle.com/datasets/camnugent/california-housing-prices>*)*, usando regressão linear e floresta aleatória.
+
+## Pacotes e função auxiliar
+
+```{r}
+library(tidyverse)
+library(ranger)
+
+plot_intervals <- function(y, y_hat_tst, lower, upper, max_n = 100, method, color = "black") {
+    coverage <- mean(lower <= tst$median_house_value & tst$median_house_value <= upper)
+    avg_width <- mean(upper - lower)
+
+    tibble(id = seq_along(y), y, y_hat_tst, lower, upper) |> 
+        filter(id <= max_n) |> 
+        ggplot(aes(x = id)) +
+            geom_errorbar(aes(ymin = lower, ymax = upper), color = color) +
+            geom_point(aes(y = y_hat_tst), color = "blue", size = 1) +
+            geom_point(aes(y = y), color = "red", size = 1) +
+            scale_y_continuous(labels = scales::dollar_format(), limits = c(0, 750000)) +
+            labs(x = "índice da amostra de teste", y = "Preço", title = method) +
+            annotate("text", x = 60, y = 625000, hjust = 0,
+                     label = sprintf("Cobertura empírica = %.1f%%",  100 * coverage)) +
+            annotate("text", x = 60, y = 550000, hjust = 0,
+                     label = paste0("Comprimento médio = $",
+                                    format(avg_width, digits = 2,
+                                           big.mark = ",", scientific = FALSE))) +
+            theme_bw()
+}
+```
+
+## Leitura de dados e divisão em treino/calibração/teste
+
+```{r}
+# Leitura dos dados
+db <- read_csv("housing.csv")
+
+skimr::skim(db)
+
+set.seed(123)
+
+# Divisão treino, calibração e teste (altere as proporções e veja o que acontece)
+ind <- sample(1:3, size = nrow(db), prob = c(0.70, 0.20, 0.10), replace = TRUE)
+
+trn <- db[ind == 1, ]
+cal <- db[ind == 2, ]
+tst <- db[ind == 3, ]
+
+# Nível de descobertura (experimente mudá-lo)
+alpha <- 0.1
+```
+
+# Regressão Linear
+
+```{r}
+# Intervalos preditivos baseados no modelo linear
+lin_reg <- lm(median_house_value ~ ., data = trn)
+
+y_hat_tst <- predict(lin_reg, newdata = tst)
+
+pred_lm <- predict(lin_reg, newdata = tst, interval = "predict", level = 0.9)
+lower_lm  <- pmax(0, pred_lm[, 2])
+upper_lm  <- pred_lm[, 3]
+
+plot_intervals(tst$median_house_value, y_hat_tst, lower_lm, upper_lm,
+               method = "Regressão Linear (Ingênuo)", color = "black")
+```
+
+```{r}
+# SCP - regressão linear
+y_hat_cal <- predict(lin_reg, newdata = cal)
+R <- abs(cal$median_house_value - y_hat_cal)
+r_hat <- unname(sort(R)[ceiling((1 - alpha) * (nrow(cal) + 1))])
+
+# Predição no conjunto de teste
+y_hat_tst <- predict(lin_reg, newdata = tst)
+sqrt(mean((tst$median_house_value - y_hat_tst)^2)) # erro de teste (RMSE)
+
+lower_scp_lm <- pmax(0, y_hat_tst - r_hat)
+upper_scp_lm <- y_hat_tst + r_hat
+
+plot_intervals(tst$median_house_value, y_hat_tst, lower_scp_lm, upper_scp_lm,
+               method = "Regressão Linear - SCP")
+```
+
+# Floresta aleatória
+
+## Split Conformal - resíduos absolutos
+
+```{r}
+# Floresta aleatória (experimente mudar num.trees e mtry)
+rf <- ranger(median_house_value ~  ., data = trn)
+
+# Escores de calibração
+y_hat_cal <- predict(rf, data = cal)$predictions
+R <- abs(cal$median_house_value - predict(rf, data = cal)$predictions)
+r_hat <- unname(sort(R)[ceiling((1 - alpha) * (nrow(cal) + 1))])
+
+# Predição no conjunto de teste
+y_hat_tst <- predict(rf, data = tst)$predictions
+sqrt(mean((tst$median_house_value - y_hat_tst)^2))  # erro de teste
+
+lower_rf <- pmax(0, y_hat_tst - r_hat)
+upper_rf <- y_hat_tst + r_hat
+
+plot_intervals(tst$median_house_value, y_hat_tst, lower_rf, upper_rf,
+               method = "Floresta Aleatória - SCP")
+```
+
+## Split Conformal - localmente ponderado
+
+```{r}
+y_hat_trn <- predict(rf, data = trn)$predictions
+
+# Modelo auxiliar para o desvio absoluto
+trn2 <- trn |>
+    mutate(delta = abs(median_house_value - y_hat_trn)) |>
+    select(-median_house_value)
+
+rf2 <- ranger(delta ~ ., data = trn2)
+
+# Predição da variabilidade na calibração
+sig_hat_cal <- predict(rf2, data = cal)$predictions
+
+# Escores normalizados
+R <- abs(cal$median_house_value - y_hat_cal) / sig_hat_cal
+r_hat <- unname(sort(R)[ceiling((1 - alpha) * (nrow(cal) + 1))])
+
+# Estimativa da variabilidade no teste
+sig_hat_tst <- predict(rf2, data = tst)$predictions
+
+# Intervalos localmente ponderados
+lower_rf_lw <- y_hat_tst - r_hat * sig_hat_tst
+upper_rf_lw <- y_hat_tst + r_hat * sig_hat_tst
+```
+
+```{r}
+plot_intervals(tst$median_house_value, y_hat_tst, lower_rf_lw, upper_rf_lw,
+               method = "Floresta Aleatória - SCP Localmente Ponderado")
+```
